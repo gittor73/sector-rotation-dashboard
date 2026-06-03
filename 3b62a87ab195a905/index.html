@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow, noarchive, nosnippet">
+<title>섹터 로테이션 RRG</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: -apple-system, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+         margin: 0; padding: 16px; background: #fafafa; color: #1a1a1a; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { font-size: 12px; color: #666; margin-bottom: 12px; }
+  #chart { width: 100%; max-width: 860px; height: 620px; margin: 0 auto; background:#fff;
+           border:1px solid #e5e5e5; border-radius:8px; }
+  .controls { max-width: 860px; margin: 12px auto; display: flex; flex-direction: column; gap: 10px; }
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .row > .label { font-size: 12px; color:#555; min-width: 64px; }
+  .chip { font-size: 12px; padding: 4px 10px; border-radius: 14px; border: 1.5px solid;
+          cursor: pointer; user-select: none; background:#fff; transition: opacity .15s; }
+  .chip.off { opacity: .3; }
+  .btn { font-size: 12px; padding: 4px 12px; border:1px solid #ccc; background:#fff;
+         border-radius: 6px; cursor:pointer; }
+  .btn.active { background:#1a1a1a; color:#fff; border-color:#1a1a1a; }
+  #dateLabel { font-variant-numeric: tabular-nums; font-weight:600; min-width: 92px; }
+  input[type=range] { flex: 1; min-width: 180px; }
+  .hint { font-size: 11px; color:#888; }
+  .disc { max-width: 860px; margin: 14px auto 0; font-size: 11px; color:#999; line-height:1.5; }
+</style>
+</head>
+<body>
+  <h1>📊 섹터 로테이션 RRG</h1>
+  <div class="sub" id="meta">불러오는 중…</div>
+  <div id="chart"></div>
+
+  <div class="controls">
+    <div class="row">
+      <span class="label">날짜</span>
+      <span id="dateLabel">—</span>
+      <input type="range" id="dateSlider" min="0" max="0" value="0">
+    </div>
+    <div class="row">
+      <span class="label">꼬리 길이</span>
+      <button class="btn" data-tail="5">5일</button>
+      <button class="btn active" data-tail="10">10일</button>
+      <button class="btn" data-tail="20">20일</button>
+      <button class="btn" id="tailsOff">꼬리 모두 끄기</button>
+      <span class="hint">점을 클릭하면 그 섹터 꼬리만 표시(과거=연한→현재=진한) · 점 크기 = 비중변화(자금이동) 크기</span>
+    </div>
+    <div class="row" id="sectorChips"><span class="label">섹터</span></div>
+  </div>
+
+  <div class="disc" id="disclaimer"></div>
+
+<script>
+const QUAD = {
+  "🟢선도":  {name:"선도",  fill:"rgba(46,204,113,0.10)"},
+  "🔵개선":  {name:"개선",  fill:"rgba(52,152,219,0.10)"},
+  "🟡약화":  {name:"약화",  fill:"rgba(241,196,15,0.12)"},
+  "🔴지체":  {name:"지체",  fill:"rgba(231,76,60,0.09)"},
+};
+const SECTOR_COLORS = {
+  "삼성전자":"#1f77b4","SK하이닉스":"#d62728","로봇":"#2ca02c","자동차":"#9467bd",
+  "2차전지":"#ff7f0e","전력에너지":"#17becf","바이오":"#8c564b",
+};
+
+let DATA, BY_SECTOR, DATES, SECTORS;
+let state = { dateIdx: 0, tailLen: 10, visible: {}, tails: {}, wtRef: 1 };
+let axis = { xmin:90, xmax:110, ymin:90, ymax:110 };
+
+const MIN_SZ = 9, MAX_SZ = 30;   // 점 크기 클램프 (0 근처도 MIN_SZ 보장)
+// 점 크기 = 비중변화(자금이동) 절대값에 비례. 시총은 의도적으로 안 씀(삼전·하닉 비대화 방지).
+function sizeFor(wt){
+  const r = Math.min(1, Math.abs(wt) / (state.wtRef || 1));
+  return MIN_SZ + (MAX_SZ - MIN_SZ) * r;
+}
+
+function fmtDate(d){ return d.slice(0,4)+"-"+d.slice(4,6)+"-"+d.slice(6,8); }
+
+fetch("data.json").then(r=>r.json()).then(d=>{
+  DATA = d;
+  document.getElementById("disclaimer").textContent =
+    "📏 " + (d.disclaimer||"투자 자문 아님") + " · 가공지표(상대강도·가중모멘텀·분면)만 표시, 원본 시세·시총 비공개. 생성 " + (d.generated_kst||"");
+  if (d.status === "warmup" || !d.points || d.points.length === 0){
+    document.getElementById("meta").textContent =
+      "⏳ 워밍업 중 — 누적 " + (d.n_days_total||0) + "/" + (d.warmup_days||100) + "거래일. 궤적은 누적 100거래일부터 표시됩니다.";
+    document.getElementById("chart").style.display = "none";
+    return;
+  }
+  SECTORS = d.sectors;
+  DATES = d.dates;
+  BY_SECTOR = {};
+  SECTORS.forEach(s => BY_SECTOR[s] = []);
+  d.points.forEach(p => { if(BY_SECTOR[p.sector]) BY_SECTOR[p.sector].push(p); });
+  SECTORS.forEach(s => BY_SECTOR[s].sort((a,b)=>a.date<b.date?-1:1));
+
+  // 축 범위(전체 점 기준, 100 포함 보장)
+  let xs=[], ys=[];
+  d.points.forEach(p=>{ xs.push(p.rs_ratio); ys.push(p.rs_mom_w); });
+  const pad=1.5;
+  axis.xmin=Math.min(100,...xs)-pad; axis.xmax=Math.max(100,...xs)+pad;
+  axis.ymin=Math.min(100,...ys)-pad; axis.ymax=Math.max(100,...ys)+pad;
+
+  // 점 크기 기준값: 전체 기간·전체 섹터의 |비중변화| 최대 → 가장 큰 자금이동이 MAX_SZ에 매핑
+  let mwt=0; d.points.forEach(p=> mwt=Math.max(mwt, Math.abs(p.weight_trend)));
+  state.wtRef = mwt || 1;
+
+  state.dateIdx = DATES.length-1;
+  SECTORS.forEach(s=> state.visible[s]=true);
+
+  buildChips();
+  const sl=document.getElementById("dateSlider");
+  sl.max=DATES.length-1; sl.value=state.dateIdx;
+  sl.addEventListener("input", e=>{ state.dateIdx=+e.target.value; render(); });
+  document.querySelectorAll("[data-tail]").forEach(b=>b.addEventListener("click", e=>{
+    state.tailLen=+e.target.dataset.tail;
+    document.querySelectorAll("[data-tail]").forEach(x=>x.classList.remove("active"));
+    e.target.classList.add("active"); render();
+  }));
+  document.getElementById("tailsOff").addEventListener("click", ()=>{ state.tails={}; render(); });
+
+  document.getElementById("meta").textContent =
+    "X=상대강도(RS-Ratio) · Y=시총가중 모멘텀 · 100 기준 4분면 · 궤적 " + DATES.length + "거래일";
+  render();
+}).catch(e=>{
+  document.getElementById("meta").textContent = "데이터 로드 실패: " + e;
+});
+
+function buildChips(){
+  const box=document.getElementById("sectorChips");
+  SECTORS.forEach(s=>{
+    const c=document.createElement("span");
+    c.className="chip"; c.textContent=s;
+    c.style.borderColor=SECTOR_COLORS[s]||"#333";
+    c.style.color=SECTOR_COLORS[s]||"#333";
+    c.addEventListener("click", ()=>{
+      state.visible[s]=!state.visible[s];
+      c.classList.toggle("off", !state.visible[s]);
+      render();
+    });
+    box.appendChild(c);
+  });
+}
+
+function quadShapes(){
+  const {xmin,xmax,ymin,ymax}=axis;
+  const rect=(x0,x1,y0,y1,fill)=>({type:"rect",xref:"x",yref:"y",
+      x0,x1,y0,y1,fillcolor:fill,line:{width:0},layer:"below"});
+  return [
+    rect(100,xmax,100,ymax,QUAD["🟢선도"].fill),   // 우상 선도
+    rect(xmin,100,100,ymax,QUAD["🔵개선"].fill),   // 좌상 개선
+    rect(100,xmax,ymin,100,QUAD["🟡약화"].fill),   // 우하 약화
+    rect(xmin,100,ymin,100,QUAD["🔴지체"].fill),   // 좌하 지체
+    {type:"line",xref:"x",yref:"y",x0:100,x1:100,y0:ymin,y1:ymax,
+       line:{color:"#bbb",width:1,dash:"dot"},layer:"below"},
+    {type:"line",xref:"x",yref:"y",x0:xmin,x1:xmax,y0:100,y1:100,
+       line:{color:"#bbb",width:1,dash:"dot"},layer:"below"},
+  ];
+}
+function quadAnnotations(){
+  const {xmin,xmax,ymin,ymax}=axis;
+  const A=(x,y,t,c)=>({xref:"x",yref:"y",x,y,text:t,showarrow:false,
+      font:{size:13,color:c},opacity:0.55});
+  return [
+    A(xmax,ymax,"🟢 선도","#1e8449"),
+    A(xmin,ymax,"🔵 개선","#21618c"),
+    A(xmax,ymin,"🟡 약화","#9a7d0a"),
+    A(xmin,ymin,"🔴 지체","#922b21"),
+  ];
+}
+
+function render(){
+  const traces=[];
+  const idx=state.dateIdx;
+  const curDate=DATES[idx];
+
+  SECTORS.forEach(s=>{
+    if(!state.visible[s]) return;
+    const arr=BY_SECTOR[s];
+    const color=SECTOR_COLORS[s]||"#333";
+    // 현재 날짜의 점 위치(해당 섹터 배열에서 curDate 인덱스)
+    let ci=arr.findIndex(p=>p.date===curDate);
+    if(ci<0) ci=arr.length-1;
+
+    // 꼬리(강조된 섹터만) — 시점별 점: 크기=그날 비중변화, 과거=연함→현재=진함
+    if(state.tails[s]){
+      const start=Math.max(0,ci-state.tailLen+1);
+      const seg=arr.slice(start,ci+1);            // 끝(현재) 포함
+      const n=seg.length;
+      if(n>1){
+        // (1) 순서용 아주 연한 보조선 (현재 점까지 연결)
+        traces.push({
+          x:seg.map(p=>p.rs_ratio), y:seg.map(p=>p.rs_mom_w),
+          mode:"lines", type:"scatter", name:s+" 꼬리선",
+          line:{color:color,width:1}, opacity:0.16,
+          showlegend:false, hoverinfo:"skip",
+        });
+        // (2) 지나온 시점 점들 — 크기=|비중변화|, opacity 그라데이션 (현재 점은 별도)
+        const past=seg.slice(0,n-1);
+        traces.push({
+          x:past.map(p=>p.rs_ratio), y:past.map(p=>p.rs_mom_w),
+          mode:"markers", type:"scatter", name:s+" 꼬리점",
+          marker:{color:color, line:{color:"#fff",width:0.5},
+                  size:past.map(p=>sizeFor(p.weight_trend)),
+                  opacity:past.map((_,k)=>0.20+0.65*((k+1)/n))},
+          customdata:past.map(p=>[s,fmtDate(p.date),p.cap_share,p.weight_trend,p.quadrant]),
+          hovertemplate:"<b>%{customdata[0]}</b> (%{customdata[1]})<br>"+
+            "상대강도 %{x:.2f} · 가중Mom %{y:.2f}<br>"+
+            "분면 %{customdata[4]} · 비중 %{customdata[2]}% (Δ%{customdata[3]:+}%p)<extra></extra>",
+          showlegend:false,
+        });
+      }
+    }
+    // 현재 점(진하게) — 크기 = |비중변화|에 비례
+    const p=arr[ci];
+    traces.push({
+      x:[p.rs_ratio], y:[p.rs_mom_w], mode:"markers+text", type:"scatter", name:s,
+      marker:{size:sizeFor(p.weight_trend),color:color,line:{color:"#fff",width:1.5}},
+      text:[s], textposition:"top center", textfont:{size:10,color:"#333"},
+      customdata:[[s,fmtDate(p.date),p.cap_share,p.weight_trend,p.quadrant]],
+      hovertemplate:"<b>%{customdata[0]}</b> (%{customdata[1]})<br>"+
+        "상대강도 %{x:.2f} · 가중Mom %{y:.2f}<br>"+
+        "분면 %{customdata[4]} · 비중 %{customdata[2]}% (Δ%{customdata[3]:+}%p)<extra></extra>",
+    });
+  });
+
+  const layout={
+    margin:{l:54,r:20,t:10,b:46},
+    xaxis:{title:"상대강도 (RS-Ratio)",range:[axis.xmin,axis.xmax],zeroline:false,
+           gridcolor:"#f0f0f0"},
+    yaxis:{title:"시총가중 모멘텀",range:[axis.ymin,axis.ymax],zeroline:false,
+           gridcolor:"#f0f0f0"},
+    shapes:quadShapes(), annotations:quadAnnotations(),
+    hovermode:"closest", plot_bgcolor:"#fff", paper_bgcolor:"#fff",
+    dragmode:false, showlegend:false,
+  };
+  document.getElementById("dateLabel").textContent=fmtDate(curDate);
+
+  const gd=document.getElementById("chart");
+  Plotly.react(gd, traces, layout, {responsive:true, displayModeBar:false});
+  if(!gd._clickBound){
+    gd.on("plotly_click", ev=>{
+      const cd=ev.points && ev.points[0] && ev.points[0].customdata;
+      if(cd){ const s=cd[0]; state.tails[s]=!state.tails[s]; render(); }
+    });
+    gd._clickBound=true;
+  }
+}
+</script>
+</body>
+</html>
